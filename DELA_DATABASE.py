@@ -380,7 +380,7 @@ def show_home():
 # ------------------ Hoofdstuk 6: Projectenmodule (algemeen & menu) ------------------
 # - Algemene helpers + entry points voor zoeken/bewerken
 
-from tkinter import simpledialog
+from tkinter import messagebox
 
 def _require_user():
     if not globals().get("current_user"):
@@ -389,278 +389,424 @@ def _require_user():
     return True
 
 def search_projects():
-    """Open zoekvenster voor projecten (geen verplichte parameters)."""
-    if not _require_user(): return
-    _project_search_window()
+    """Open zoekvenster voor projecten (raadplegen)."""
+    if not _require_user(): 
+        return
+    # modus 'view' = dubbelklik opent read-only detailpagina
+    open_project_search(mode="view")
 
 def edit_project_entry():
-    """Vraag projectnummer en open bewerkvenster."""
-    if not _require_user(): return
-    pnr = simpledialog.askstring("Project bewerken", "Geef projectnummer in (exact):")
-    if not pnr: return
-    row = db_query("SELECT * FROM projects WHERE projectnummer = ?", (pnr,), fetchone=True)
-    if not row:
-        messagebox.showinfo("Niet gevonden", f"Geen project met nummer '{pnr}'.")
+    """Open zoekvenster voor projecten (bewerken)."""
+    if not _require_user(): 
         return
-    open_project_edit_form(dict(row))
+    # modus 'edit' = dubbelklik opent bewerkvenster
+    open_project_search(mode="edit")
 
 # ------------------ Hoofdstuk 7: Projecten (zoeken & bewerken) ------------------
-# Bevat de zoeklijst en functies om projecten te openen of te bewerken.
-# SQL-versie: gebruikt de tabel "projects" in plaats van projects.csv.
 
-def search_projects_window():
-    if not current_user:
-        messagebox.showwarning("Login vereist", "Gelieve eerst in te loggen via het startscherm.")
+import tkinter as tk
+from tkinter import ttk, messagebox
+import sqlite3
+
+# Fallback voor now_str indien elders nog niet gedefinieerd
+try:
+    now_str
+except NameError:
+    from datetime import datetime
+    def now_str():
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def open_project_search(mode="view"):
+    """
+    Zoekvenster voor projecten.
+    mode = "view"  -> dubbelklik opent read-only detailpagina
+    mode = "edit"  -> dubbelklik opent bewerkvenster
+    """
+    win = tk.Toplevel(root)
+    win.title("Projecten zoeken" + (" (bewerken)" if mode == "edit" else ""))
+    win.geometry("1100x640")
+
+    # --- Filterbalk (per kolom) ---
+    filter_frame = tk.LabelFrame(win, text="Filters")
+    filter_frame.pack(fill="x", padx=10, pady=8, ipady=4)
+
+    fields = [
+        ("Bureau", "bureau"),
+        ("Projectnummer", "projectnummer"),
+        ("Klant", "klant"),
+        ("Projectnaam", "projectnaam"),
+        ("Adres", "adres"),
+        ("Status", "status"),
+    ]
+    vars_ = {}
+    col = 0
+    for label, key in fields:
+        tk.Label(filter_frame, text=label).grid(row=0, column=col*2, sticky="w", padx=(8,4), pady=6)
+        v = tk.StringVar()
+        e = tk.Entry(filter_frame, textvariable=v, width=18)
+        e.grid(row=0, column=col*2+1, sticky="w", padx=(0,8), pady=6)
+        vars_[key] = v
+        col += 1
+
+    btns = tk.Frame(filter_frame)
+    btns.grid(row=0, column=col*2, padx=8)
+
+    def clear_filters():
+        for v in vars_.values():
+            v.set("")
+        do_search()
+
+    search_btn = tk.Button(btns, text="Zoeken", width=10, command=lambda: do_search())
+    reset_btn  = tk.Button(btns, text="Reset",  width=10, command=clear_filters)
+    search_btn.pack(side="left", padx=4)
+    reset_btn.pack(side="left", padx=4)
+
+    # --- Resultaten tabel ---
+    cols = ("bureau", "projectnummer", "klant", "projectnaam", "adres", "status", "laatst_gewijzigd_door", "laatst_gewijzigd_op")
+    tree = ttk.Treeview(win, columns=cols, show="headings")
+    headers = {
+        "bureau":"Bureau", "projectnummer":"Projectnummer", "klant":"Klant", "projectnaam":"Projectnaam",
+        "adres":"Adres", "status":"Status", "laatst_gewijzigd_door":"Gewijzigd door", "laatst_gewijzigd_op":"Gewijzigd op"
+    }
+    widths  = {
+        "bureau":110, "projectnummer":130, "klant":160, "projectnaam":220,
+        "adres":240, "status":110, "laatst_gewijzigd_door":120, "laatst_gewijzigd_op":150
+    }
+    for c in cols:
+        tree.heading(c, text=headers[c])
+        tree.column(c, width=widths[c], anchor="w")
+    tree.pack(fill="both", expand=True, padx=10, pady=(6,2))
+
+    yscroll = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
+    tree.configure(yscroll=yscroll.set)
+    yscroll.place(in_=tree, relx=1.0, rely=0, relheight=1.0, x=-1)
+
+    # --- Acties onderaan ---
+    bottom = tk.Frame(win)
+    bottom.pack(fill="x", padx=10, pady=8)
+    info_label = tk.Label(bottom, text=("Dubbelklik opent detail (read-only)" if mode=="view" else "Dubbelklik opent bewerken"))
+    info_label.pack(side="left")
+
+    def selected_id():
+        sel = tree.selection()
+        return int(sel[0]) if sel else None
+
+    def on_double(_evt=None):
+        pid = selected_id()
+        if not pid:
+            return
+        if mode == "view":
+            show_project_detail(pid)
+        else:
+            open_project_edit_form(pid)
+
+    tree.bind("<Double-1>", on_double)
+
+    # --- Zoeken ---
+    def do_search():
+        # Dynamisch WHERE opbouwen met LIKE per ingevulde filter
+        where = []
+        params = []
+        for key in ("bureau", "projectnummer", "klant", "projectnaam", "adres", "status"):
+            val = vars_[key].get().strip()
+            if val:
+                where.append(f"{key} LIKE ?")
+                params.append(f"%{val}%")
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+        try:
+            rows = db_query(f"""
+                SELECT id, bureau, projectnummer, klant, projectnaam, adres, status, laatst_gewijzigd_door, laatst_gewijzigd_op
+                FROM projects
+                {where_sql}
+                ORDER BY COALESCE(laatst_gewijzigd_op,'') DESC, id DESC
+            """, tuple(params), fetchall=True)
+        except sqlite3.OperationalError as e:
+            messagebox.showerror("Databasefout", f"Query mislukt:\n{e}")
+            return
+
+        for iid in tree.get_children():
+            tree.delete(iid)
+        if rows:
+            for r in rows:
+                tree.insert("", "end", iid=str(r["id"]), values=(
+                    r["bureau"] or "", r["projectnummer"] or "", r["klant"] or "",
+                    r["projectnaam"] or "", r["adres"] or "", r["status"] or "",
+                    r.get("laatst_gewijzigd_door","") or "", r.get("laatst_gewijzigd_op","") or ""
+                ))
+
+    # initial load
+    do_search()
+
+
+def show_project_detail(project_id:int):
+    """Read-only detailpagina van een project, alle info onder elkaar, selecteer/kopëerbaar."""
+    row = db_query("SELECT * FROM projects WHERE id=?", (project_id,), fetchone=True)
+    if not row:
+        messagebox.showerror("Fout", "Project niet gevonden.")
         return
 
     win = tk.Toplevel(root)
-    win.title("Projecten zoeken")
-    win.geometry("800x600")
+    win.title(f"Project {row['projectnummer']} – detail")
+    win.geometry("640x520")
 
-    # Zoekveld
-    tk.Label(win, text="Zoekterm:").pack(pady=5)
-    keyword_var = tk.StringVar()
-    entry = tk.Entry(win, textvariable=keyword_var)
-    entry.pack(fill="x", padx=10, pady=5)
+    frame = tk.Frame(win)
+    frame.pack(fill="both", expand=True, padx=10, pady=10)
+    frame.grid_columnconfigure(1, weight=1)
 
-    results_box = tk.Listbox(win)
-    results_box.pack(fill="both", expand=True, padx=10, pady=5)
+    def add(label, value, r):
+        tk.Label(frame, text=label + ":", anchor="w", width=18).grid(row=r, column=0, sticky="w", pady=4, padx=(0,8))
+        txt = tk.Entry(frame)
+        txt.insert(0, value or "")
+        txt.config(state="readonly", readonlybackground="white")
+        txt.grid(row=r, column=1, sticky="ew", pady=4)
 
-    def do_search(*_):
-        keyword = f"%{keyword_var.get()}%"
-        rows = db_query("""
-            SELECT id, bureau, projectnummer, klant, projectnaam, stad, status
-            FROM projects
-            WHERE projectnummer LIKE ? OR klant LIKE ? OR projectnaam LIKE ? OR stad LIKE ?
-            ORDER BY laatst_gewijzigd_op DESC
-        """, (keyword, keyword, keyword, keyword), fetchall=True)
+    r = 0
+    add("Bureau", row.get("bureau",""), r); r+=1
+    add("Projectnummer", row.get("projectnummer",""), r); r+=1
+    add("Gekoppeld nummer", row.get("gekoppeld_nummer",""), r); r+=1
+    add("Klant", row.get("klant",""), r); r+=1
+    add("Projectnaam", row.get("projectnaam",""), r); r+=1
+    add("Adres", row.get("adres",""), r); r+=1
+    add("Status", row.get("status",""), r); r+=1
+    add("Laatst gewijzigd door", row.get("laatst_gewijzigd_door",""), r); r+=1
+    add("Laatst gewijzigd op", row.get("laatst_gewijzigd_op",""), r); r+=1
 
-        results_box.delete(0, tk.END)
-        for r in rows:
-            line = f"{r['bureau']} {r['projectnummer']} - {r['klant']} ({r['projectnaam']}, {r['stad']}) [{r['status']}]"
-            results_box.insert(tk.END, line)
-            results_box.itemconfig(tk.END, {'project_id': r['id']})  # project_id bijhouden
-
-    entry.bind("<Return>", do_search)
-    tk.Button(win, text="Zoek", command=do_search).pack(pady=5)
-
-    def on_open_selected():
-        selection = results_box.curselection()
-        if not selection:
-            messagebox.showwarning("Geen selectie", "Selecteer een project om te openen/bewerken.")
-            return
-        idx = selection[0]
-        # project_id terugvinden
-        proj_id = results_box.itemcget(idx, 'project_id')
-        if proj_id:
-            edit_project(int(proj_id))
-
-    tk.Button(win, text="Open geselecteerd project", command=on_open_selected).pack(pady=5)
+    tk.Button(win, text="Sluiten", command=win.destroy).pack(pady=8)
 
 
-def edit_project(project_id=None):
-    """
-    Project bewerken of bekijken.
-    Als project_id gegeven is, laad dat project. Anders foutmelding.
-    """
-    if not current_user:
-        messagebox.showwarning("Login vereist", "Gelieve eerst in te loggen.")
-        return
-
-    if not project_id:
-        messagebox.showwarning("Geen project", "Er werd geen geldig project gekozen.")
-        return
-
+def open_project_edit_form(project_id:int):
+    """Bewerkvenster met opslaan."""
     row = db_query("SELECT * FROM projects WHERE id=?", (project_id,), fetchone=True)
     if not row:
-        messagebox.showerror("Fout", "Project niet gevonden in de database.")
+        messagebox.showerror("Fout", "Project niet gevonden.")
         return
 
     win = tk.Toplevel(root)
     win.title(f"Project {row['projectnummer']} bewerken")
-    win.geometry("600x500")
-    win.columnconfigure(1, weight=1)
+    win.geometry("660x520")
+    win.grid_columnconfigure(1, weight=1)
 
-    def row_entry(label, value, r):
-        tk.Label(win, text=label, anchor="w").grid(row=r, column=0, sticky="w", padx=8, pady=6)
-        var = tk.StringVar(value=value)
-        ent = tk.Entry(win, textvariable=var)
-        ent.grid(row=r, column=1, sticky="ew", padx=8, pady=6)
+    def mk_row(label, value, r, readonly=False):
+        tk.Label(win, text=label+":", anchor="w").grid(row=r, column=0, sticky="w", padx=10, pady=6)
+        var = tk.StringVar(value=value or "")
+        e = tk.Entry(win, textvariable=var)
+        if readonly:
+            e.config(state="readonly", readonlybackground="white")
+        e.grid(row=r, column=1, sticky="ew", padx=10, pady=6)
         return var
 
-    klant_var = row_entry("Klant", row["klant"], 0)
-    naam_var = row_entry("Projectnaam", row["projectnaam"], 1)
-    straat_var = row_entry("Straat", row["adres"], 2)
-    stad_var = row_entry("Stad", row["stad"], 3)
-    status_var = row_entry("Status", row["status"], 4)
+    v_bureau   = mk_row("Bureau", row.get("bureau",""), 0, readonly=True)
+    v_nummer   = mk_row("Projectnummer", row.get("projectnummer",""), 1, readonly=True)
+    v_koppeld  = mk_row("Gekoppeld nummer", row.get("gekoppeld_nummer",""), 2)
+    v_klant    = mk_row("Klant", row.get("klant",""), 3)
+    v_naam     = mk_row("Projectnaam", row.get("projectnaam",""), 4)
+    v_adres    = mk_row("Adres", row.get("adres",""), 5)
+    v_status   = mk_row("Status", row.get("status",""), 6)
 
-    def save_changes():
-        newdata = {
-            "klant": klant_var.get(),
-            "projectnaam": naam_var.get(),
-            "adres": straat_var.get(),
-            "stad": stad_var.get(),
-            "status": status_var.get(),
-            "laatst_gewijzigd_door": current_user,
-            "laatst_gewijzigd_op": now_str()
-        }
-        db_update("projects", newdata, "id=?", (project_id,))
-        messagebox.showinfo("Succes", "Project bijgewerkt.")
-        win.destroy()
+    def save():
+        try:
+            db_update(
+                "projects",
+                {
+                    "gekoppeld_nummer": v_koppeld.get().strip(),
+                    "klant": v_klant.get().strip(),
+                    "projectnaam": v_naam.get().strip(),
+                    "adres": v_adres.get().strip(),
+                    "status": v_status.get().strip(),
+                    "laatst_gewijzigd_door": globals().get("current_user") or "",
+                    "laatst_gewijzigd_op": now_str(),
+                },
+                "id=?",
+                (project_id,)
+            )
+            messagebox.showinfo("Succes", "Wijzigingen opgeslagen.")
+            win.destroy()
+        except sqlite3.Error as e:
+            messagebox.showerror("Fout", f"Opslaan mislukt:\n{e}")
 
-    tk.Button(win, text="Opslaan", command=save_changes).grid(row=99, column=1, sticky="e", padx=8, pady=12)
-
+    tk.Button(win, text="Opslaan", command=save).grid(row=99, column=1, sticky="e", padx=10, pady=12)
 
 # ------------------ Hoofdstuk 8: Nieuw project wizard ------------------
-# Hiermee kan een gebruiker een nieuw project aanmaken (Delafontaine of Vector).
-# Inclusief login-check, klant dropdown (readonly, start leeg), en velden.
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import sqlite3
+import re
+
+# Helpers naar Hoofdstuk 4 (Vlaamse steden & Postcodes):
+def _postcode_for_city(city:str):
+    # Als jouw Hoofdstuk 4 een dict POSTCODES of CITY_TO_POSTCODE heeft:
+    for key in ("POSTCODES", "CITY_TO_POSTCODE", "VLAAMSE_POSTCODES"):
+        d = globals().get(key)
+        if isinstance(d, dict) and city in d:
+            return str(d[city])
+    # Of een helperfunctie:
+    for fn in ("get_postcode_for_city", "postcode_for_city"):
+        f = globals().get(fn)
+        if callable(f):
+            try:
+                pc = f(city)
+                if pc: return str(pc)
+            except Exception:
+                pass
+    return ""
+
+def _all_known_cities():
+    # Probeer lijst uit Hoofdstuk 4 te halen
+    for key in ("VLAAMSE_STEDEN", "CITIES", "ALL_CITIES"):
+        arr = globals().get(key)
+        if isinstance(arr, (list, tuple)) and arr:
+            return list(arr)
+    return []  # fallback lege lijst => manueel typen blijft mogelijk
+
+def _next_project_number():
+    """Bepaalt volgende numerieke projectnummer (max + 1)."""
+    try:
+        rows = db_query("SELECT projectnummer FROM projects", fetchall=True)
+    except Exception:
+        return "1"
+    max_num = 0
+    for r in rows or []:
+        val = r["projectnummer"]
+        if val is None:
+            continue
+        m = re.fullmatch(r"\s*(\d+)\s*", str(val))
+        if m:
+            n = int(m.group(1))
+            if n > max_num:
+                max_num = n
+    return str(max_num + 1 if max_num >= 0 else 1)
+
+def _exists_projectnummer(pnr:str)->bool:
+    row = db_query("SELECT 1 AS x FROM projects WHERE projectnummer = ?", (pnr,), fetchone=True)
+    return bool(row)
 
 def new_project_wizard():
-    if not current_user:
-        messagebox.showwarning("Login vereist", "Gelieve eerst in te loggen.")
-        return
-
-    # Stap 1: kies type project (Delafontaine of Vector)
-    win = tk.Toplevel(root)
-    win.title("Nieuw project - Kies type")
-    tk.Label(win, text="Welk type project?").pack(pady=10)
-
-    def open_form(bureau):
-        win.destroy()
-        open_project_form(bureau)
-
-    tk.Button(win, text="Delafontaine", width=20, command=lambda: open_form("Delafontaine")).pack(pady=5)
-    tk.Button(win, text="Vector", width=20, command=lambda: open_form("Vector")).pack(pady=5)
-
-
-def open_project_form(bureau):
-    form_win = tk.Toplevel(root)
-    form_win.title(f"Nieuw project ({bureau})")
-
-    entries = {}
-
-    row = 0
-    # Projectnummer
-    prefix = "V" if bureau == "Vector" else ""
-    tk.Label(form_win, text="Projectnummer:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    proj_num_var = tk.StringVar(value=prefix)
-    entries["projectnummer"] = tk.Entry(form_win, textvariable=proj_num_var)
-    entries["projectnummer"].grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-
-    # Gekoppeld nummer
-    row += 1
-    tk.Label(form_win, text="Gekoppeld nummer (optioneel):").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    gekoppeld_var = tk.StringVar()
-    entries["gekoppeld_nummer"] = tk.Entry(form_win, textvariable=gekoppeld_var)
-    entries["gekoppeld_nummer"].grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-
-    # Klant (dropdown, readonly, leeg)
-    row += 1
-    tk.Label(form_win, text="Klant:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    klanten_rows = db_query("SELECT bedrijf FROM contacts WHERE type='bedrijf' ORDER BY bedrijf", fetchall=True)
-    klanten = [r["bedrijf"] for r in klanten_rows] if klanten_rows else []
-    klant_var = tk.StringVar(value="")  # leeg starten
-    klant_cb = ttk.Combobox(form_win, textvariable=klant_var, values=klanten, state="readonly")
-    klant_cb.grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-    entries["klant"] = klant_cb
-
-    # Knop nieuwe klant
-    def add_new_client():
-        open_company_form(after_save=lambda r: refresh_clients(klant_cb, klant_var))
-
-    tk.Button(form_win, text="Nieuwe klant", command=add_new_client).grid(row=row, column=2, padx=5, pady=5)
-
-    def refresh_clients(combo, var):
-        rows = db_query("SELECT bedrijf FROM contacts WHERE type='bedrijf' ORDER BY bedrijf", fetchall=True)
-        values = [r["bedrijf"] for r in rows] if rows else []
-        combo["values"] = values
-        var.set("")
-
-    # Projectnaam
-    row += 1
-    tk.Label(form_win, text="Projectnaam:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    entries["projectnaam"] = tk.Entry(form_win)
-    entries["projectnaam"].grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-
-    # Straat
-    row += 1
-    tk.Label(form_win, text="Straat:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    entries["straat"] = tk.Entry(form_win)
-    entries["straat"].grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-
-    # Huisnummer
-    row += 1
-    tk.Label(form_win, text="Huisnummer:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    entries["huisnummer"] = tk.Entry(form_win)
-    entries["huisnummer"].grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-
-    # Stad (dropdown → auto vul postcode)
-    row += 1
-    tk.Label(form_win, text="Stad:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    stad_var = tk.StringVar()
-    stad_cb = ttk.Combobox(form_win, textvariable=stad_var, values=sorted(FLEMISH_CITIES.keys()), state="readonly")
-    stad_cb.grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-    entries["stad"] = stad_var
-
-    row += 1
-    tk.Label(form_win, text="Postcode:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    postcode_var = tk.StringVar()
-    entries["postcode"] = tk.Entry(form_win, textvariable=postcode_var, state="readonly")
-    entries["postcode"].grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-
-    def on_city_select(event=None):
-        city = stad_var.get()
-        if city in FLEMISH_CITIES:
-            postcode_var.set(FLEMISH_CITIES[city])
-
-    stad_cb.bind("<<ComboboxSelected>>", on_city_select)
-
-    # Type project
-    row += 1
-    tk.Label(form_win, text="Type project:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    type_var = tk.StringVar()
-    type_cb = ttk.Combobox(form_win, textvariable=type_var,
-                           values=["Industrie", "School", "Particulier"], state="readonly")
-    type_cb.grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-    entries["type_project"] = type_var
-
-    # Soort project
-    row += 1
-    tk.Label(form_win, text="Soort project:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
-    soort_var = tk.StringVar()
-    soort_cb = ttk.Combobox(form_win, textvariable=soort_var,
-                            values=["Nieuwbouw", "Renovatie", "Regularisatie", "Combinatie"], state="readonly")
-    soort_cb.grid(row=row, column=1, padx=5, pady=5, sticky="ew")
-    entries["soort_project"] = soort_var
-
-    # Opslaan knop
-    def save_project():
-        data = {
-            "bureau": bureau,
-            "projectnummer": proj_num_var.get().strip(),
-            "gekoppeld_nummer": gekoppeld_var.get().strip(),
-            "klant": klant_var.get().strip(),
-            "projectnaam": entries["projectnaam"].get().strip(),
-            "adres": f"{entries['straat'].get().strip()} {entries['huisnummer'].get().strip()}",
-            "type_project": type_var.get().strip(),
-            "status": "nieuw",
-            "laatst_gewijzigd_door": current_user,
-            "laatst_gewijzigd_op": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        db_insert("projects", data)
-        messagebox.showinfo("Succes", "Project succesvol aangemaakt.")
-        form_win.destroy()
-
-    row += 1
-    tk.Button(form_win, text="Project aanmaken", command=save_project).grid(row=row, column=1, pady=15)
-
-
-def search_projects():
-    if not current_user:
+    if not globals().get("current_user"):
         messagebox.showwarning("Login vereist", "Gelieve eerst in te loggen via het startscherm.")
         return
-    # TODO: zoekscherm voor projecten
-    messagebox.showinfo("Zoeken", "Project zoeken functie komt hier.")
+
+    win = tk.Toplevel(root)
+    win.title("Nieuw project")
+    win.geometry("640x560")
+    win.grid_columnconfigure(1, weight=1)
+
+    # --- Bureau keuze ---
+    tk.Label(win, text="Bureau:", anchor="w").grid(row=0, column=0, sticky="w", padx=10, pady=(12,6))
+    bureau_var = tk.StringVar(value="Delafontaine")
+    bureau_box = ttk.Combobox(win, textvariable=bureau_var, values=["Delafontaine", "Vector"], state="readonly", width=22)
+    bureau_box.grid(row=0, column=1, sticky="w", padx=10, pady=(12,6))
+
+    # --- Projectnummer (auto ingevuld maar bewerkbaar) ---
+    tk.Label(win, text="Projectnummer:", anchor="w").grid(row=1, column=0, sticky="w", padx=10, pady=6)
+    pnr_var = tk.StringVar(value=_next_project_number())
+    pnr_entry = tk.Entry(win, textvariable=pnr_var)
+    pnr_entry.grid(row=1, column=1, sticky="ew", padx=10, pady=6)
+
+    # --- Gekoppeld nummer (label + prefix afhankelijk van bureau) ---
+    kopp_label = tk.Label(win, text="Gekoppeld Vector nummer (optioneel):", anchor="w")
+    kopp_label.grid(row=2, column=0, sticky="w", padx=10, pady=6)
+    kopp_var = tk.StringVar(value="V")
+    kopp_entry = tk.Entry(win, textvariable=kopp_var)
+    kopp_entry.grid(row=2, column=1, sticky="ew", padx=10, pady=6)
+
+    def _update_koppeld_label(*_):
+        if bureau_var.get() == "Delafontaine":
+            kopp_label.config(text="Gekoppeld Vector nummer (optioneel):")
+            if not kopp_var.get():
+                kopp_var.set("V")
+        else:
+            kopp_label.config(text="Gekoppeld Delafontaine nummer (optioneel):")
+            if not kopp_var.get():
+                kopp_var.set("D")
+    bureau_box.bind("<<ComboboxSelected>>", _update_koppeld_label)
+
+    # --- Klant & Projectnaam ---
+    tk.Label(win, text="Klant:", anchor="w").grid(row=3, column=0, sticky="w", padx=10, pady=6)
+    klant_var = tk.StringVar()
+    tk.Entry(win, textvariable=klant_var).grid(row=3, column=1, sticky="ew", padx=10, pady=6)
+
+    tk.Label(win, text="Projectnaam:", anchor="w").grid(row=4, column=0, sticky="w", padx=10, pady=6)
+    naam_var = tk.StringVar()
+    tk.Entry(win, textvariable=naam_var).grid(row=4, column=1, sticky="ew", padx=10, pady=6)
+
+    # --- Stad & Postcode (editable) ---
+    tk.Label(win, text="Stad:", anchor="w").grid(row=5, column=0, sticky="w", padx=10, pady=6)
+    steden = _all_known_cities()
+    stad_var = tk.StringVar()
+    stad_combo = ttk.Combobox(win, textvariable=stad_var, values=steden, state="normal")  # EDITABLE
+    stad_combo.grid(row=5, column=1, sticky="ew", padx=10, pady=6)
+
+    tk.Label(win, text="Postcode:", anchor="w").grid(row=6, column=0, sticky="w", padx=10, pady=6)
+    postcode_var = tk.StringVar()
+    postcode_entry = tk.Entry(win, textvariable=postcode_var)  # EDITABLE
+    postcode_entry.grid(row=6, column=1, sticky="w", padx=10, pady=6)
+
+    def on_city_selected(_evt=None):
+        pc = _postcode_for_city(stad_var.get().strip())
+        if pc and not postcode_var.get():
+            postcode_var.set(pc)
+    stad_combo.bind("<<ComboboxSelected>>", on_city_selected)
+
+    # --- Straat + Huisnummer (optioneel) -> adres samenstellen
+    tk.Label(win, text="Straat + nr (optioneel):", anchor="w").grid(row=7, column=0, sticky="w", padx=10, pady=6)
+    straat_var = tk.StringVar()
+    tk.Entry(win, textvariable=straat_var).grid(row=7, column=1, sticky="ew", padx=10, pady=6)
+
+    # --- Status ---
+    tk.Label(win, text="Status:", anchor="w").grid(row=8, column=0, sticky="w", padx=10, pady=6)
+    status_var = tk.StringVar(value="Nieuw")
+    status_combo = ttk.Combobox(win, textvariable=status_var, values=["Nieuw", "Lopend", "Afgewerkt", "On hold"], state="readonly")
+    status_combo.grid(row=8, column=1, sticky="w", padx=10, pady=6)
+
+    # --- Opslaan ---
+    def save():
+        bureau = bureau_var.get().strip()
+        pnr   = pnr_var.get().strip()
+
+        # 1) projectnummer verplicht en uniek
+        if not pnr:
+            messagebox.showerror("Fout", "Projectnummer is verplicht.")
+            return
+        if _exists_projectnummer(pnr):
+            messagebox.showerror("Fout", f"Projectnummer '{pnr}' bestaat al.")
+            return
+
+        # 2) basisvalidatie
+        klant = klant_var.get().strip()
+        naam  = naam_var.get().strip()
+        stad  = stad_var.get().strip()
+        pc    = postcode_var.get().strip()
+        straat= straat_var.get().strip()
+        status= status_var.get().strip()
+        kopp  = kopp_var.get().strip()
+
+        # 3) adres samenstellen
+        parts = []
+        if straat: parts.append(straat)
+        if pc or stad:
+            parts.append(" ".join([pc, stad]).strip())
+        adres = ", ".join([p for p in parts if p]) if parts else (stad or "")
+
+        try:
+            db_query("""
+                INSERT INTO projects (bureau, projectnummer, gekoppeld_nummer, klant, projectnaam, adres, status, laatst_gewijzigd_door, laatst_gewijzigd_op)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                bureau, pnr, kopp, klant, naam, adres, status,
+                globals().get("current_user") or "", now_str()
+            ))
+            messagebox.showinfo("Succes", f"Project '{pnr}' succesvol opgeslagen.")
+            win.destroy()
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE" in str(e).upper():
+                messagebox.showerror("Fout", f"Projectnummer '{pnr}' bestaat al.")
+            else:
+                messagebox.showerror("Databasefout", f"Opslaan mislukt:\n{e}")
+        except sqlite3.Error as e:
+            messagebox.showerror("Databasefout", f"Opslaan mislukt:\n{e}")
+
+    tk.Button(win, text="Opslaan", command=save).grid(row=99, column=1, sticky="e", padx=10, pady=12)
 
 # ------------------ Hoofdstuk 9: Contacten zoeken ------------------
 # Laat toe om te zoeken in de SQLite tabel 'contacts'.
@@ -1241,10 +1387,11 @@ def edit_contacts():
     do_search()
 
 # =========================
-# Hoofdstuk 15: Applicatie-start
+# Hoofdstuk 15: Applicatie-start (snelheid verbeterd)
 # =========================
+
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import simpledialog, messagebox
 import sqlite3
 import os
 from PIL import Image, ImageTk
@@ -1253,10 +1400,8 @@ from PIL import Image, ImageTk
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "dela_database.db")
 
-
 def get_connection():
     return sqlite3.connect(DB_PATH)
-
 
 def init_colleagues():
     """Zorg dat de tabel 'colleagues' bestaat en vul standaard namen in."""
@@ -1269,16 +1414,18 @@ def init_colleagues():
         )
     """)
     conn.commit()
-    # Voeg standaard collega's toe als ze nog niet bestaan
-    defaults = ["Felix", "Michael", "Kris", "Pascal", "Annelies"]
+
+    defaults = globals().get("DEFAULT_USERS") or [
+        "Felix", "Kris", "Michael", "Pascal",
+        "Heidi V.", "Heidi D.", "Marie-Roos", "Jelle",
+        "Quinten", "Rik", "Maaike"
+    ]
+
     for d in defaults:
-        try:
-            cur.execute("INSERT OR IGNORE INTO colleagues (name) VALUES (?)", (d,))
-        except Exception:
-            pass
+        cur.execute("INSERT OR IGNORE INTO colleagues (name) VALUES (?)", (d,))
+
     conn.commit()
     conn.close()
-
 
 # --- Hulpfuncties voor logo’s ---
 def _safe_open_image(path):
@@ -1287,26 +1434,22 @@ def _safe_open_image(path):
     except Exception:
         return None
 
-
 def _resize_keep_aspect(img, max_w, max_h):
+    """Sneller schalen met BILINEAR i.p.v. LANCZOS."""
     if not img:
         return None
     iw, ih = img.size
     scale = min(max_w / iw, max_h / ih)
     new_size = (max(1, int(iw * scale)), max(1, int(ih * scale)))
-    return img.resize(new_size, Image.LANCZOS)
-
+    return img.resize(new_size, Image.BILINEAR)
 
 def _render_logos(parent, max_frac_w=0.6, max_frac_h_each=0.25, smaller_second=True):
-    """Plaats twee logo's gecentreerd onder elkaar, proportioneel geschaald."""
-    # Verwijder vorige logo-container
     if getattr(root, "_logo_frame", None):
         root._logo_frame.destroy()
-
     logo_frame = tk.Frame(parent)
     logo_frame.pack(expand=True)
-
     base_dir = os.path.dirname(os.path.abspath(__file__))
+
     if not hasattr(root, "_pil_logo1"):
         root._pil_logo1 = _safe_open_image(os.path.join(base_dir, "Logo_Delafontaine.png"))
     if not hasattr(root, "_pil_logo2"):
@@ -1327,18 +1470,15 @@ def _render_logos(parent, max_frac_w=0.6, max_frac_h_each=0.25, smaller_second=T
 
         W = max(root.winfo_width(), 400)
         H = max(root.winfo_height(), 400)
-
         max_w = int(W * max_frac_w)
         max_h_each = int(H * max_frac_h_each)
 
-        # Eerste logo
         img1r = _resize_keep_aspect(root._pil_logo1, max_w, max_h_each)
         if img1r:
             tkimg1 = ImageTk.PhotoImage(img1r)
             logo1_label.config(image=tkimg1, text="")
             logo1_label.image = tkimg1
 
-        # Tweede logo
         if smaller_second:
             max_w2, max_h2 = int(max_w * 0.8), int(max_h_each * 0.8)
         else:
@@ -1353,25 +1493,23 @@ def _render_logos(parent, max_frac_w=0.6, max_frac_h_each=0.25, smaller_second=T
     logo_frame.bind("<Configure>", _update_logos)
     root.after(50, _update_logos)
 
-
 # --- Login flow ---
 current_user = None
-
+_selected_colleague = None  # om te onthouden wie geselecteerd is
 
 def show_start_screen():
-    """Toon startscherm met logo’s en login-knop."""
     for w in root.winfo_children():
         w.destroy()
-
     _render_logos(root)
-
     btn = tk.Button(root, text="LOGIN", font=("Arial", 12, "bold"),
                     command=show_login_screen, width=15)
     btn.pack(pady=20)
 
-
 def show_login_screen():
-    """Toon het login-scherm met collega's."""
+    """Toon login scherm met namen en onderaan + / - knoppen."""
+    global _selected_colleague
+    _selected_colleague = None
+
     for w in root.winfo_children():
         w.destroy()
 
@@ -1383,6 +1521,7 @@ def show_login_screen():
     names = [r[0] for r in cur.fetchall()]
     conn.close()
 
+    # Lijst knoppen
     for naam in names:
         frame = tk.Frame(root, relief="groove", borderwidth=1)
         frame.pack(pady=3, padx=20, fill="x")
@@ -1390,39 +1529,89 @@ def show_login_screen():
                         command=lambda n=naam: do_login(n))
         btn.pack(fill="x")
 
+    # Onderste kader met + en -
+    ctrl_frame = tk.Frame(root, relief="groove", borderwidth=1)
+    ctrl_frame.pack(pady=5, padx=20, fill="x")
+
+    add_btn = tk.Button(ctrl_frame, text="+", width=3,
+                        command=add_colleague, bg="lightgrey")
+    add_btn.pack(side="left", padx=5, pady=3)
+
+    rem_btn = tk.Button(ctrl_frame, text="-", width=3,
+                        command=remove_colleague, bg="lightgrey")
+    rem_btn.pack(side="left", padx=5, pady=3)
 
 def do_login(naam):
-    """Inloggen en hoofdmenu tonen."""
     global current_user
     current_user = naam
     show_main_menu()
 
+def add_colleague():
+    """Popup om collega toe te voegen."""
+    naam = simpledialog.askstring("Nieuwe collega", "Naam:")
+    if naam:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("INSERT INTO colleagues (name) VALUES (?)", (naam,))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            messagebox.showerror("Fout", f"Collega '{naam}' bestaat al.")
+        conn.close()
+        show_login_screen()
+
+def remove_colleague():
+    """Laat gebruiker naam kiezen om te verwijderen."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM colleagues ORDER BY name")
+    names = [r[0] for r in cur.fetchall()]
+    conn.close()
+
+    if not names:
+        messagebox.showinfo("Leeg", "Geen collega om te verwijderen.")
+        return
+
+    naam = simpledialog.askstring("Collega verwijderen",
+                                  "Geef exacte naam in om te verwijderen:\n\n" + ", ".join(names))
+    if naam and naam in names:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM colleagues WHERE name = ?", (naam,))
+        conn.commit()
+        conn.close()
+        show_login_screen()
+    elif naam:
+        messagebox.showerror("Niet gevonden", f"Collega '{naam}' niet gevonden.")
 
 # --- Hoofdmenu ---
 def show_main_menu():
-    """Toon hoofdmenu (menu’s + logo’s)."""
     for w in root.winfo_children():
         w.destroy()
 
     menubar = tk.Menu(root)
+
     projecten_menu = tk.Menu(menubar, tearoff=0)
-    projecten_menu.add_command(label="Nieuw project", command=lambda: print("Nieuw project"))
-    projecten_menu.add_command(label="Project zoeken", command=lambda: print("Project zoeken"))
-    projecten_menu.add_command(label="Project bewerken", command=lambda: print("Project bewerken"))
+    projecten_menu.add_command(label="Nieuw project", command=new_project_wizard)
+    projecten_menu.add_command(label="Project zoeken", command=search_projects_window)
+    projecten_menu.add_command(label="Project bewerken", command=edit_project_entry)
     menubar.add_cascade(label="Projecten", menu=projecten_menu)
 
     contacten_menu = tk.Menu(menubar, tearoff=0)
-    contacten_menu.add_command(label="Nieuw bedrijf", command=lambda: print("Nieuw bedrijf"))
-    contacten_menu.add_command(label="Nieuwe persoon", command=lambda: print("Nieuwe persoon"))
-    contacten_menu.add_command(label="Contacten zoeken", command=lambda: print("Contacten zoeken"))
-    contacten_menu.add_command(label="Contacten bewerken", command=lambda: print("Contacten bewerken"))
+    contacten_menu.add_command(label="Nieuw bedrijf", command=open_company_form)
+    contacten_menu.add_command(label="Nieuwe persoon", command=open_person_form)
+    contacten_menu.add_command(label="Contacten zoeken", command=search_contacts)
+    contacten_menu.add_command(label="Contacten bewerken", command=edit_contacts)
     menubar.add_cascade(label="Contacten", menu=contacten_menu)
 
     menubar.add_command(label="Afsluiten", command=root.destroy)
     root.config(menu=menubar)
 
-    _render_logos(root)
+    if current_user:
+        lbl_user = tk.Label(root, text=f"Ingelogd als: {current_user}", anchor="e")
+        lbl_user.pack(fill="x", padx=8, pady=4)
 
+    _render_logos(root)
 
 # --- Main ---
 def main():
@@ -1430,9 +1619,10 @@ def main():
     show_start_screen()
     root.mainloop()
 
-
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("Dela Database")
     root.geometry("800x600")
     main()
+
+
